@@ -1,0 +1,14 @@
+# Build artifacts
+/target
+/dist
+
+# Ignore secrets and environment files
+.env
+.env.*
+
+# System files and temporary development files
+.DS_Store
+
+# Random
+notes.md
+

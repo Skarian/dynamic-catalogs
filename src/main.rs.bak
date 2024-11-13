@@ -1,0 +1,240 @@
+use addon::catalog::{CatalogGenre, CatalogType};
+use anyhow::{anyhow, Context, Result};
+use axum::extract::{Path, Query};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::{routing::get, Router};
+use globals::set_globals;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
+use trakt::{get_trakt_list_id, TraktCatalog, TraktEndpoint, TraktResponses};
+
+mod addon;
+mod globals;
+mod trakt;
+
+use addon::Addon;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Set relevant environment variables and make available globally
+    set_globals()?;
+
+    let cors = CorsLayer::new().allow_origin(Any);
+
+    // ServeDir for /dashboard and fallback to index.html
+    let dashboard_service =
+        ServeDir::new("dist").fallback(ServeFile::new(PathBuf::from("dist/index.html")));
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/example-trakt", get(example_trakt))
+        .route("/trakt/extract-list-id", get(trakt_list_id))
+        .route("/trakt-genres", get(trakt_genres))
+        .route("/:config/manifest.json", get(manifest))
+        .route("/:config/catalog/:type/*catalog_path", get(catalog))
+        .nest_service("/:config/configure", dashboard_service)
+        .layer(cors);
+
+    let address = "127.0.0.1:8080";
+
+    println!("Server listening at {}", address);
+
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .context("Unable to bind TCP Listener")?;
+    axum::serve(listener, app)
+        .await
+        .context("Unable to serve axum server")?;
+    Ok(())
+}
+
+async fn health() -> &'static str {
+    "Server is up!"
+}
+
+async fn example_trakt() -> String {
+    let mut catalog = TraktCatalog::query(TraktEndpoint::List, CatalogType::Movie);
+    catalog.list_id("20764770");
+    catalog.extended_info();
+    catalog.as_b64().unwrap()
+}
+
+async fn trakt_genres() -> Result<impl IntoResponse, (StatusCode, String)> {
+    let catalog = TraktCatalog::query(TraktEndpoint::Genres, CatalogType::Series)
+        .build()
+        .await
+        .unwrap();
+    if let TraktResponses::Genres(genres) = catalog {
+        let genres_json = json!(genres);
+        Ok((StatusCode::OK, axum::response::Json(genres_json)))
+    } else {
+        let genres_json = json!({"genres": []});
+        Ok((StatusCode::OK, axum::response::Json(genres_json)))
+    }
+}
+
+async fn manifest(Path(_config): Path<String>) -> impl IntoResponse {
+    let addon = Addon::build().await;
+
+    let manifest = json!(addon.manifest);
+    (StatusCode::OK, axum::response::Json(manifest))
+}
+
+#[derive(Debug)]
+struct CatalogPathOptions {
+    catalog_id: String,
+    pagination: Option<PaginationOptions>,
+    genre: Option<String>,
+}
+
+impl CatalogPathOptions {
+    fn from_path(catalog_path: &str) -> Result<Self> {
+        let catalog_path_segments: Vec<&str> = catalog_path
+            .strip_suffix(".json")
+            .unwrap()
+            .split("/")
+            .collect();
+
+        const PAGE_SIZE: i32 = 100;
+        let mut skip = None;
+        let mut genre = None;
+        match &catalog_path_segments.len() {
+            1 => Ok(CatalogPathOptions {
+                catalog_id: catalog_path_segments[0].to_string(),
+                pagination: Some(PaginationOptions {
+                    page: 1,
+                    page_size: PAGE_SIZE,
+                }),
+                genre: None,
+            }),
+            2 => {
+                let catalog_id = catalog_path_segments[0].to_string();
+                let other_catalog_params: Vec<String> = catalog_path_segments[1]
+                    .split("&")
+                    .map(|path| path.to_string())
+                    .collect();
+
+                for param in &other_catalog_params {
+                    let parts: Vec<&str> = param.split("=").collect();
+                    if parts.len() == 2 {
+                        match parts[0] {
+                            "skip" => skip = Some(parts[1].parse::<i32>().unwrap()),
+                            "genre" => genre = Some(parts[1].to_string()),
+                            _ => {}
+                        }
+                    }
+                }
+
+                let page = if let Some(skip_value) = skip {
+                    skip_value / PAGE_SIZE + 1
+                } else {
+                    1
+                };
+
+                // TODO:
+                Ok(CatalogPathOptions {
+                    catalog_id,
+                    pagination: Some(PaginationOptions {
+                        page,
+                        page_size: PAGE_SIZE,
+                    }),
+                    genre,
+                })
+            }
+            _ => Err(anyhow!("Incorrect catalog path options provided")),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PaginationOptions {
+    page: i32,
+    page_size: i32,
+}
+
+async fn catalog(
+    Path((config, catalog_type, catalog_path)): Path<(String, CatalogType, String)>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // four scenarios
+    // normal request:           /:config/catalog/:catalog_type/catalog_id.json
+    // with pagination:          /:config/catalog/:catalog_type/catalog_id/skip=200.json
+    // with genres:              /:config/catalog/:catalog_type/catalog_id/genre=Adventure.json
+    // with genres + pagination: /:config/catalog/:catalog_type/catalog_id/skip=43&genre=2024.json
+    //
+    //Axum route configuration: .route("/:config/catalog/:catalog_type/*catalog_path", get(catalog))
+
+    // Ensure the path ends with `.json`
+    if !catalog_path.ends_with(".json") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            String::from("API expects GET request for JSON file. No valid extension provided."),
+        ));
+    }
+
+    let catalog_path_options = CatalogPathOptions::from_path(&catalog_path);
+    println!("{:#?}", catalog_path_options);
+
+    // Check if the path includes `skip` (e.g., `movieCatalog/skip=100.json`)
+    let (base_catalog_id, skip) = if let Some(skip_pos) = catalog_path.find("/skip=") {
+        let base = &catalog_path[..skip_pos];
+        let skip_value = catalog_path[skip_pos + 6..catalog_path.len() - 5]
+            .parse::<i32>()
+            .unwrap_or(0);
+        (base, skip_value)
+    } else {
+        // No `skip` parameter, so set skip to 0
+        (&catalog_path[..catalog_path.len() - 5], 0) // Removing ".json"
+    };
+
+    let page_size: i32 = 100;
+    let page = skip / page_size + 1;
+
+    let output_catalog_decoded = TraktCatalog::from_b64(base_catalog_id);
+
+    match output_catalog_decoded {
+        Ok(mut output_catalog) => {
+            let final_trakt_response = output_catalog
+                .pagination(page, page_size)
+                .build()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            if let TraktResponses::CatalogResponse(catalog_response) = final_trakt_response {
+                let output_value = serde_json::to_value(catalog_response)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+                Ok((StatusCode::OK, axum::response::Json(output_value)))
+            } else {
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Unable to extract CatalogResponse from TraktResponses".to_string(),
+                ))
+            }
+        }
+        Err(e) => {
+            let error_message = format!("Catalog not authorized for this device: {}", e);
+            Err((StatusCode::UNAUTHORIZED, error_message))
+        }
+    }
+}
+
+async fn trakt_list_id(
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let mut list_id = String::new();
+    if let Some(url) = params.get("url") {
+        let scraped_id = get_trakt_list_id(url)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        list_id.push_str(&scraped_id);
+    } else {
+        return Err(StatusCode::NO_CONTENT);
+    }
+    let id_json = json!({"id": list_id});
+    Ok((StatusCode::OK, axum::response::Json(id_json)))
+}
