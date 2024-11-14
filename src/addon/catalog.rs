@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::trakt::{TraktCatalog, TraktEndpoint, TraktReponse};
+use crate::trakt::{TraktCatalog, TraktEndpoint, TraktResponse};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CatalogSource {
@@ -69,7 +69,7 @@ impl Catalog {
                 .await
                 .unwrap();
 
-        if let TraktReponse::Genres(genres) = trakt_movie_genres_query {
+        if let TraktResponse::Genres(genres) = trakt_movie_genres_query {
             trakt_movies_genres = genres.into_iter().map(|genre| genre.slug).collect()
         }
 
@@ -80,7 +80,7 @@ impl Catalog {
                 .await
                 .unwrap();
 
-        if let TraktReponse::Genres(genres) = trakt_series_genres_query {
+        if let TraktResponse::Genres(genres) = trakt_series_genres_query {
             trakt_series_genres = genres.into_iter().map(|genre| genre.slug).collect()
         }
 
@@ -95,10 +95,17 @@ impl Catalog {
             name: "Netflix TV Shows".to_string(),
             id: "eyJlbmRwb2ludCI6Ikxpc3QiLCJwYWdpbmF0aW9uIjpudWxsLCJleHRlbmRlZF9pbmZvIjp0cnVlLCJsaXN0X2lkIjoiMjA3NjQ0NzEiLCJjYXRhbG9nX3R5cGUiOiJzZXJpZXMifQ==-trakt".to_string(),
             catalog_type: CatalogType::Series,
+            extra: vec![Extra::new("skip", None, false), Extra::new("genre",Some(trakt_sort_values.clone()), false)],
+        };
+
+        let catalog3 = Self {
+            name: "Broken Catalog YAY".to_string(),
+            id: "elkajsdfyJlbmRwb2ludCI6Ikxpc3QiLCJwYWdpbmF0aW9uIjpudWxsLCJleHRlbmRlZF9pbmZvIjp0cnVlLCJsaXN0X2lkIjoiMjA3NjQ0NzEiLCJjYXRhbG9nX3R5cGUiOiJzZXJpZXMifQ==-trakt".to_string(),
+            catalog_type: CatalogType::Series,
             extra: vec![Extra::new("skip", None, false), Extra::new("genre",Some(trakt_sort_values), false)],
         };
 
-        vec![catalog1, catalog2]
+        vec![catalog1, catalog2, catalog3]
     }
 }
 
@@ -115,13 +122,35 @@ impl CatalogResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefaultVideoID {
+    pub default_video_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Trailer {
+    pub source: String,
+    #[serde(rename = "type")]
+    pub trailer_type: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CatalogMeta {
     #[serde(rename = "type")]
     pub catalog_type: CatalogType,
-    id: String,
-    name: String,
-    poster: String,
-    genres: Option<Vec<String>>,
+    pub id: String,
+    pub name: String,
+    pub poster: Option<String>,
+    pub background: Option<String>,
+    pub genres: Option<Vec<String>>,
+    pub release_info: Option<String>,
+    pub description: Option<String>,
+    pub behavior_hints: Option<DefaultVideoID>,
+    pub trailer: Option<Trailer>,
+    pub logo: Option<String>,
+    pub runtime: Option<String>,
 }
 
 impl CatalogMeta {
@@ -136,8 +165,15 @@ impl CatalogMeta {
             catalog_type: catalog_meta_type,
             id: id.to_string(),
             name: name.to_string(),
-            poster: format!("https://images.metahub.space/poster/medium/{}/img", id),
+            poster: None,
             genres: None,
+            background: None,
+            release_info: None,
+            description: None,
+            behavior_hints: None,
+            trailer: None,
+            logo: None,
+            runtime: None,
         }
     }
 

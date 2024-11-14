@@ -1,5 +1,6 @@
 use addon::catalog::{CatalogPathOptions, CatalogSource, CatalogType};
-use anyhow::{anyhow, Context, Result};
+use addon::Addon;
+use anyhow::{Context, Result};
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -10,13 +11,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
-use trakt::{get_trakt_list_id, TraktCatalog, TraktEndpoint, TraktReponse};
+use trakt::{get_trakt_list_id, TraktCatalog, TraktEndpoint, TraktResponse};
 
 mod addon;
 mod globals;
 mod trakt;
-
-use addon::Addon;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -58,9 +57,18 @@ async fn health() -> &'static str {
 
 async fn example_trakt() -> String {
     let mut catalog = TraktCatalog::query(TraktEndpoint::List, CatalogType::Movie);
+    catalog.pagination(1, 500);
     catalog.list_id("20764770");
     catalog.extended_info();
-    catalog.as_b64().unwrap()
+    println!("catalog: {:#?}", catalog);
+
+    let res = catalog.build().await.unwrap();
+    if let TraktResponse::CatalogResponse(cat) = res {
+        println!("Values given back: {}", cat.metas.len());
+    }
+
+    // catalog.as_b64().unwrap();
+    String::from("TODO: REPLACE THIS")
 }
 
 async fn trakt_genres() -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -68,7 +76,7 @@ async fn trakt_genres() -> Result<impl IntoResponse, (StatusCode, String)> {
         .build()
         .await
         .unwrap();
-    if let TraktReponse::Genres(genres) = query {
+    if let TraktResponse::Genres(genres) = query {
         let genres_json = json!(genres);
         Ok((StatusCode::OK, axum::response::Json(genres_json)))
     } else {

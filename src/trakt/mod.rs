@@ -1,15 +1,21 @@
 use crate::{
-    addon::catalog::{CatalogMeta, CatalogPathOptions, CatalogResponse, CatalogType},
+    addon::catalog::{
+        CatalogMeta, CatalogPathOptions, CatalogResponse, CatalogType, DefaultVideoID,
+        PaginationPath, Trailer,
+    },
     globals::{Environment, GlobalClient},
 };
 use anyhow::{anyhow, Context, Result};
+use api::TraktItem;
 use axum::http::HeaderMap;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::Url;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{from_value, Value};
 use std::fmt::{self, Display};
+
+pub mod api;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TraktCatalog {
@@ -101,7 +107,7 @@ impl TraktCatalog {
             )
         })?;
 
-        if let TraktReponse::CatalogResponse(catalog_response) = trakt_response {
+        if let TraktResponse::CatalogResponse(catalog_response) = trakt_response {
             let output_value = serde_json::to_value(catalog_response)
                 .context("Unable to convert TraktResponse of type CatalogResponse to JSON value")?;
             Ok(output_value)
@@ -116,17 +122,38 @@ impl TraktCatalog {
         &mut self,
         catalog_path_options: &CatalogPathOptions,
     ) -> &mut Self {
+        // When the endpoint is TraktEndpoint::List and a genre is selected, since Trakt's API does
+        // not allow sorting via parameters, instead 500 items are pulled on the first page's
+        // requests. Any additional page requests are set to empty responses in the build function
+        // to avoid sending duplicative catalogs
+        let pagination = {
+            if let TraktEndpoint::List = self.endpoint {
+                if catalog_path_options.genre.is_some() {
+                    PaginationPath {
+                        page: catalog_path_options.pagination.page,
+                        page_size: 500,
+                    }
+                } else {
+                    PaginationPath {
+                        page: catalog_path_options.pagination.page,
+                        page_size: catalog_path_options.pagination.page_size,
+                    }
+                }
+            } else {
+                PaginationPath {
+                    page: catalog_path_options.pagination.page,
+                    page_size: catalog_path_options.pagination.page_size,
+                }
+            }
+        };
         if let Some(genre) = &catalog_path_options.genre {
             self.genre(genre.as_str());
         }
-        self.pagination(
-            catalog_path_options.pagination.page,
-            catalog_path_options.pagination.page_size,
-        );
+        self.pagination(pagination.page, pagination.page_size);
         self
     }
 
-    pub async fn build(&self) -> Result<TraktReponse> {
+    pub async fn build(&self) -> Result<TraktResponse> {
         let env = Environment::get().context("Unable to get global Environment for Trakt query")?;
         let client = GlobalClient::get()?;
 
@@ -138,7 +165,7 @@ impl TraktCatalog {
 
         let mut url = Url::parse("https://api.trakt.tv")?;
 
-        // Convert catalog type to valid value for Trakt API
+        // Convert catalog type to valid string for Trakt API
         let trakt_catalog_type = match self.catalog_type {
             CatalogType::Movie => "movies",
             CatalogType::Series => "shows",
@@ -189,15 +216,35 @@ impl TraktCatalog {
 
         let output = self
             .endpoint
-            .parse_output(json)
+            .parse_output(json, &self.genre)
             .map_err(|e| anyhow!("Unable to parse output from Trakt API: {}", e.to_string()))?;
+
+        // Print the number of meta items returned
+        if let TraktResponse::CatalogResponse(cat) = &output {
+            let count = cat.metas.len();
+            println!("Returned {} meta objects", count);
+        }
+
+        // This is a continuation of the logic in self::add_catalog_path_options.
+        // If additional pages are being requested when its on the List endpoint and there is a genre (sorting)
+        // set, send an empty response, first response had 500 to compensate
+        if matches!(self.endpoint, TraktEndpoint::List)
+            && self.genre.is_some()
+            && self
+                .pagination
+                .as_ref()
+                .map_or(false, |p| p.current_page > 1)
+        {
+            let empty_response = TraktResponse::CatalogResponse(CatalogResponse::new_empty());
+            return Ok(empty_response);
+        }
 
         Ok(output)
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum TraktReponse {
+pub enum TraktResponse {
     CatalogResponse(CatalogResponse),
     Genres(Vec<TraktGenre>),
 }
@@ -210,82 +257,93 @@ pub enum TraktEndpoint {
 }
 
 impl TraktEndpoint {
-    fn parse_output(&self, data: Value) -> Result<TraktReponse> {
+    fn parse_output(&self, data: Value, genre: &Option<String>) -> Result<TraktResponse> {
         match self {
             TraktEndpoint::TrendingMovies => {
-                Ok(TraktReponse::CatalogResponse(CatalogResponse::new_empty()))
+                Ok(TraktResponse::CatalogResponse(CatalogResponse::new_empty()))
             }
             TraktEndpoint::List => {
-                // Initialize return object
-                let mut catalog_response = CatalogResponse::new_empty();
+                let api_data: Vec<TraktItem> = from_value(data.clone())?;
 
-                let data_array = data.as_array().ok_or_else(|| {
-                    anyhow!("Parsing Trakt Endpoint: {:#?}: Expected JSON array", &self)
-                })?;
+                // Add sorting logic
+                let mut new_catalog_response = CatalogResponse::new_empty();
 
-                // Map through each member of the json array
-                for entry in data_array.iter() {
-                    // Required meta
-                    let input_type = match entry.get("type").and_then(|t| t.as_str()) {
-                        Some(t) => t,
-                        None => {
-                            return Err(anyhow!("Parsing Trakt Endpoint ({:#?}): Missing or invalid 'key' in entry: {:?}",&self, entry));
+                for entry in &api_data {
+                    let (id, title, description, genres, released, youtube, runtime) = match entry {
+                        TraktItem::Movie { movie, .. } => (
+                            movie.ids.imdb.clone(),
+                            movie.title.clone(),
+                            movie.overview.clone(),
+                            movie.genres.clone(),
+                            movie.year,
+                            movie.trailer.clone(),
+                            movie.runtime,
+                        ),
+                        TraktItem::Show { show, .. } => (
+                            show.ids.imdb.clone(),
+                            show.title.clone(),
+                            show.overview.clone(),
+                            show.genres.clone(),
+                            show.year,
+                            show.trailer.clone(),
+                            show.runtime,
+                        ),
+                    };
+
+                    let catalog_type = match entry {
+                        TraktItem::Movie { .. } => CatalogType::Movie,
+                        TraktItem::Show { .. } => CatalogType::Series,
+                    };
+
+                    let poster = format!("https://images.metahub.space/poster/medium/{}/img", id);
+                    let background =
+                        format!("https://images.metahub.space/background/medium/{}/img", id);
+
+                    let logo = format!("https://images.metahub.space/logo/medium/{}/img", id);
+
+                    let runtime_string = runtime.map(|e| format!("{} mins", e));
+
+                    let behavior_hints = DefaultVideoID {
+                        default_video_id: id.clone(),
+                    };
+
+                    let released_string: Option<String> = released.map(|num| num.to_string());
+
+                    let trailer = match youtube {
+                        Some(youtube_link) => {
+                            let youtube_code = extract_video_id(&youtube_link);
+                            match youtube_code {
+                                Ok(code) => {
+                                    let trailer_object = Trailer {
+                                        source: code.to_string(),
+                                        trailer_type: "Trailer".to_string(),
+                                    };
+                                    Some(trailer_object)
+                                }
+                                Err(_) => None,
+                            }
                         }
-                    };
-                    let meta_type = if input_type == "show" {
-                        "series"
-                    } else {
-                        input_type
+                        None => None,
                     };
 
-                    let inner_entry = match entry.get(input_type) {
-                        Some(inner) => inner,
-                        None => {
-                            // Handle missing key in entry
-                            return Err(anyhow!(
-                                "Missing key '{}' in entry: {:?}",
-                                input_type,
-                                entry
-                            ));
-                        }
+                    let meta_item = CatalogMeta {
+                        id,
+                        name: title,
+                        catalog_type,
+                        genres,
+                        release_info: released_string,
+                        background: Some(background),
+                        poster: Some(poster),
+                        description,
+                        behavior_hints: Some(behavior_hints),
+                        trailer,
+                        logo: Some(logo),
+                        runtime: runtime_string,
                     };
 
-                    let imdb_id = match inner_entry
-                        .get("ids")
-                        .and_then(|ids| ids.get("imdb"))
-                        .and_then(|id| id.as_str())
-                    {
-                        Some(id) => id,
-                        None => {
-                            return Err(anyhow!(
-                                "Missing or invalid 'imdb' ID in entry: {:?}",
-                                entry
-                            ));
-                        }
-                    };
-
-                    let title = match inner_entry.get("title").and_then(|t| t.as_str()) {
-                        Some(t) => t,
-                        None => {
-                            return Err(anyhow!(
-                                "Missing or invalid 'title' in entry: {:?}",
-                                entry
-                            ));
-                        }
-                    };
-
-                    // Final Meta struct
-                    let mut catalog_item = CatalogMeta::new(imdb_id, title, meta_type);
-                    // Optional Meta
-
-                    let genres = extract_genres(inner_entry)
-                        .map_err(|e| anyhow!("Unable to extract genres: {}", e))?;
-
-                    catalog_item.genres(genres);
-
-                    catalog_response.metas.push(catalog_item);
+                    new_catalog_response.metas.push(meta_item);
                 }
-                Ok(TraktReponse::CatalogResponse(catalog_response))
+                Ok(TraktResponse::CatalogResponse(new_catalog_response))
             }
             TraktEndpoint::Genres => {
                 let genres: Vec<TraktGenre> = serde_json::from_value(data).map_err(|e| {
@@ -294,7 +352,7 @@ impl TraktEndpoint {
                         e
                     )
                 })?;
-                Ok(TraktReponse::Genres(genres))
+                Ok(TraktResponse::Genres(genres))
             }
         }
     }
@@ -302,8 +360,8 @@ impl TraktEndpoint {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TraktPagination {
-    current_page: i32,
-    items_per_page: i32,
+    pub current_page: i32,
+    pub items_per_page: i32,
 }
 
 impl TraktPagination {
@@ -351,18 +409,13 @@ pub struct TraktGenre {
     pub slug: String,
 }
 
-fn extract_genres(inner_entry: &Value) -> Result<Vec<String>> {
-    inner_entry
-        .get("genres")
-        .context("Failed to get 'genres' field from entry")?
-        .as_array()
-        .context("'genres' field is not an array")?
-        .iter()
-        .map(|genre| {
-            genre
-                .as_str()
-                .context("Expected each genre to be a string")
-                .map(|s| s.to_string())
-        })
-        .collect()
+fn extract_video_id(url: &str) -> Result<&str> {
+    // Try to find the index of "v=" in the URL
+    if let Some(start) = url.find("v=") {
+        // Safely get the next 11 characters as the video ID
+        return url
+            .get(start + 2..start + 13)
+            .ok_or_else(|| anyhow!("Failed to extract video ID"));
+    }
+    Err(anyhow!("URL does not contain a video ID"))
 }
