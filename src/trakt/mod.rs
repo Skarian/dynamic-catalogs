@@ -1,7 +1,7 @@
 use crate::{
     addon::catalog::{
-        CatalogMeta, CatalogPathOptions, CatalogResponse, CatalogType, DefaultVideoID,
-        PaginationPath, Trailer,
+        CatalogMeta, CatalogRequestParams, CatalogResponse, CatalogType, DefaultVideoID,
+        PaginationDetails, Trailer,
     },
     globals::{Environment, GlobalClient},
 };
@@ -28,16 +28,16 @@ pub struct TraktCatalog {
 }
 
 impl TraktCatalog {
-    pub fn query(endpoint: TraktEndpoint, catalog_type: CatalogType) -> TraktCatalog {
-        Self {
-            endpoint,
-            pagination: None,
-            extended_info: false,
-            list_id: None,
-            catalog_type,
-            genre: None,
-        }
-    }
+    // pub fn query(endpoint: TraktEndpoint, catalog_type: CatalogType) -> TraktCatalog {
+    //     Self {
+    //         endpoint,
+    //         pagination: None,
+    //         extended_info: false,
+    //         list_id: None,
+    //         catalog_type,
+    //         genre: None,
+    //     }
+    // }
 
     pub fn pagination(&mut self, current_page: i32, items_per_page: i32) -> &mut Self {
         let pagination_details = TraktPagination::new(current_page, items_per_page);
@@ -45,62 +45,60 @@ impl TraktCatalog {
         self
     }
 
-    pub fn extended_info(&mut self) -> &mut Self {
-        self.extended_info = true;
-        self
-    }
+    // pub fn list_id(&mut self, id: &str) -> &mut Self {
+    //     self.list_id = Some(id.to_string());
+    //     self
+    // }
 
-    pub fn list_id(&mut self, id: &str) -> &mut Self {
-        self.list_id = Some(id.to_string());
-        self
-    }
+    // #[allow(dead_code)]
+    // pub fn as_b64(&self) -> Result<String> {
+    //     let output_catalog_str = serde_json::to_string(self).map_err(|e| {
+    //         anyhow!(
+    //             "as_b64: Unable to convert TraktCatalog to string: {}",
+    //             e.to_string()
+    //         )
+    //     })?;
+    //     let mut output_string = STANDARD.encode(&output_catalog_str);
+    //     output_string.push_str("-trakt");
+    //
+    //     Ok(output_string)
+    // }
 
-    pub fn genre(&mut self, genre: &str) -> &mut Self {
-        self.genre = Some(genre.to_string());
-        self
-    }
+    pub async fn from_catalog_params(
+        catalog_request_params: &CatalogRequestParams,
+    ) -> Result<Value> {
+        // Our catalog struct has been stored in the "catalog_id" catalog parameter provided by
+        // Stremio on the request to the catalog endpoint, we will decode and convert to struct
 
-    pub fn as_b64(&self) -> Result<String> {
-        let output_catalog_str = serde_json::to_string(self).map_err(|e| {
-            anyhow!(
-                "as_b64: Unable to convert TraktCatalog to string: {}",
-                e.to_string()
-            )
-        })?;
-        let mut output_string = STANDARD.encode(&output_catalog_str);
-        output_string.push_str("-trakt");
-
-        Ok(output_string)
-    }
-
-    pub async fn from_catalog_path(path_options: &CatalogPathOptions) -> Result<Value> {
-        let output_catalog_str_decoded =
-            STANDARD.decode(&path_options.catalog_id).map_err(|e| {
+        let catalog_id_decoded = STANDARD
+            .decode(&catalog_request_params.catalog_id)
+            .map_err(|e| {
                 anyhow!(
                     "from_b64: Error decoding TraktCatalog from b64 to a vec: {}",
                     e.to_string()
                 )
             })?;
 
-        let output_catalog_str_decoded_json = String::from_utf8(output_catalog_str_decoded)
-            .map_err(|e| {
-                anyhow!(
-                    "from_b64: Error converting decoded b64 value to json string: {}",
-                    e.to_string()
-                )
-            })?;
+        let catalog_id_decoded_str = String::from_utf8(catalog_id_decoded).map_err(|e| {
+            anyhow!(
+                "from_b64: Error converting decoded b64 value to json string: {}",
+                e.to_string()
+            )
+        })?;
 
-        let mut output_catalog: TraktCatalog =
-            serde_json::from_str(output_catalog_str_decoded_json.as_str()).map_err(|e| {
+        println!("catalog_id_decoded_str: {catalog_id_decoded_str}");
+
+        let mut trakt_catalog_from_catalog_id: TraktCatalog =
+            serde_json::from_str(catalog_id_decoded_str.as_str()).map_err(|e| {
                 anyhow!(
                     "from_b64: Error converting decoded json string to TraktCatalog struct: {}",
                     e.to_string()
                 )
             })?;
 
-        output_catalog.add_catalog_path_options(path_options);
+        trakt_catalog_from_catalog_id.handle_pagination_based_on_genre(catalog_request_params);
 
-        let trakt_response = output_catalog.build().await.map_err(|e| {
+        let trakt_response = trakt_catalog_from_catalog_id.build().await.map_err(|e| {
             anyhow!(
                 "Unable to build CatalogResponse from Trakt catalog query: {}",
                 e.to_string()
@@ -118,9 +116,9 @@ impl TraktCatalog {
         }
     }
 
-    pub fn add_catalog_path_options(
+    pub fn handle_pagination_based_on_genre(
         &mut self,
-        catalog_path_options: &CatalogPathOptions,
+        catalog_path_options: &CatalogRequestParams,
     ) -> &mut Self {
         // When the endpoint is TraktEndpoint::List and a genre is selected, since Trakt's API does
         // not allow sorting via parameters, instead 500 items are pulled on the first page's
@@ -129,26 +127,23 @@ impl TraktCatalog {
         let pagination = {
             if let TraktEndpoint::List = self.endpoint {
                 if catalog_path_options.genre.is_some() {
-                    PaginationPath {
+                    PaginationDetails {
                         page: catalog_path_options.pagination.page,
                         page_size: 500,
                     }
                 } else {
-                    PaginationPath {
+                    PaginationDetails {
                         page: catalog_path_options.pagination.page,
                         page_size: catalog_path_options.pagination.page_size,
                     }
                 }
             } else {
-                PaginationPath {
+                PaginationDetails {
                     page: catalog_path_options.pagination.page,
                     page_size: catalog_path_options.pagination.page_size,
                 }
             }
         };
-        if let Some(genre) = &catalog_path_options.genre {
-            self.genre(genre.as_str());
-        }
         self.pagination(pagination.page, pagination.page_size);
         self
     }
@@ -169,7 +164,6 @@ impl TraktCatalog {
         let trakt_catalog_type = match self.catalog_type {
             CatalogType::Movie => "movies",
             CatalogType::Series => "shows",
-            _ => return Err(anyhow!("Invalid Trakt Catalog Type")),
         };
 
         // Append query string based on query type
@@ -182,7 +176,6 @@ impl TraktCatalog {
                     Err(anyhow!("No list provided in Trakt List endpoint"))
                 }
             }
-            TraktEndpoint::Genres => Ok(vec!["genres", trakt_catalog_type]),
         }?;
 
         url.path_segments_mut()
@@ -219,22 +212,11 @@ impl TraktCatalog {
             .parse_output(json, &self.genre)
             .map_err(|e| anyhow!("Unable to parse output from Trakt API: {}", e.to_string()))?;
 
-        // Print the number of meta items returned
-        if let TraktResponse::CatalogResponse(cat) = &output {
-            let count = cat.metas.len();
-            println!("Returned {} meta objects", count);
-        }
-
         // This is a continuation of the logic in self::add_catalog_path_options.
         // If additional pages are being requested when its on the List endpoint and there is a genre (sorting)
         // set, send an empty response, first response had 500 to compensate
-        if matches!(self.endpoint, TraktEndpoint::List)
-            && self.genre.is_some()
-            && self
-                .pagination
-                .as_ref()
-                .map_or(false, |p| p.current_page > 1)
-        {
+        // 01/20/2025 - Change, no longer want genres on Trakt catalogs
+        if matches!(self.endpoint, TraktEndpoint::List) && self.genre.is_some() {
             let empty_response = TraktResponse::CatalogResponse(CatalogResponse::new_empty());
             return Ok(empty_response);
         }
@@ -253,13 +235,13 @@ pub enum TraktResponse {
 pub enum TraktEndpoint {
     TrendingMovies,
     List,
-    Genres,
 }
 
 impl TraktEndpoint {
     fn parse_output(&self, data: Value, genre: &Option<String>) -> Result<TraktResponse> {
         match self {
             TraktEndpoint::TrendingMovies => {
+                // TODO: Implement Trending movies
                 Ok(TraktResponse::CatalogResponse(CatalogResponse::new_empty()))
             }
             TraktEndpoint::List => {
@@ -344,15 +326,6 @@ impl TraktEndpoint {
                     new_catalog_response.metas.push(meta_item);
                 }
                 Ok(TraktResponse::CatalogResponse(new_catalog_response))
-            }
-            TraktEndpoint::Genres => {
-                let genres: Vec<TraktGenre> = serde_json::from_value(data).map_err(|e| {
-                    anyhow!(
-                        "Unable to convert TraktGenre from JSON value to struct: {}",
-                        e
-                    )
-                })?;
-                Ok(TraktResponse::Genres(genres))
             }
         }
     }

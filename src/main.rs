@@ -1,4 +1,4 @@
-use addon::catalog::{CatalogPathOptions, CatalogSource, CatalogType};
+use addon::catalog::{CatalogRequestParams, CatalogSource, CatalogType};
 use addon::Addon;
 use anyhow::{Context, Result};
 use axum::extract::{Path, Query};
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
-use trakt::{get_trakt_list_id, TraktCatalog, TraktEndpoint, TraktResponse};
+use trakt::{get_trakt_list_id, TraktCatalog};
 
 mod addon;
 mod globals;
@@ -30,12 +30,11 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/example-trakt", get(example_trakt))
-        .route("/trakt/extract-list-id", get(trakt_list_id))
-        .route("/trakt-genres", get(trakt_genres))
         .route("/:config/manifest.json", get(manifest))
-        .route("/:config/catalog/:type/*catalog_path", get(catalog))
         .nest_service("/:config/configure", dashboard_service)
+        .route("/:config/catalog/:type/*stremio_catalog_path", get(catalog))
+        // .route("/example-trakt", get(example_trakt))
+        .route("/trakt/extract-list-id", get(trakt_list_id))
         .layer(cors);
 
     let address = "127.0.0.1:8080";
@@ -55,63 +54,53 @@ async fn health() -> &'static str {
     "Server is up!"
 }
 
-async fn example_trakt() -> String {
-    let mut catalog = TraktCatalog::query(TraktEndpoint::List, CatalogType::Movie);
-    catalog.pagination(1, 500);
-    catalog.list_id("20764770");
-    catalog.extended_info();
-    println!("catalog: {:#?}", catalog);
+// async fn example_trakt() -> String {
+//     let mut catalog = TraktCatalog::query(TraktEndpoint::List, CatalogType::Movie);
+//     catalog.pagination(1, 100);
+//     catalog.list_id("20764770");
+//     println!("catalog: {:#?}", catalog);
+//
+//     let res = catalog.build().await.unwrap();
+//     if let TraktResponse::CatalogResponse(cat) = res {
+//         println!("Values given back: {}", cat.metas.len());
+//     }
+//
+//     // catalog.as_b64().unwrap();
+//     String::from("TODO: REPLACE THIS")
+// }
 
-    let res = catalog.build().await.unwrap();
-    if let TraktResponse::CatalogResponse(cat) = res {
-        println!("Values given back: {}", cat.metas.len());
-    }
-
-    // catalog.as_b64().unwrap();
-    String::from("TODO: REPLACE THIS")
-}
-
-async fn trakt_genres() -> Result<impl IntoResponse, (StatusCode, String)> {
-    let query = TraktCatalog::query(TraktEndpoint::Genres, CatalogType::Movie)
-        .build()
+async fn manifest(Path(config): Path<String>) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let addon = Addon::build(&config)
         .await
-        .unwrap();
-    if let TraktResponse::Genres(genres) = query {
-        let genres_json = json!(genres);
-        Ok((StatusCode::OK, axum::response::Json(genres_json)))
-    } else {
-        let genres_json = json!({"genres": []});
-        Ok((StatusCode::OK, axum::response::Json(genres_json)))
-    }
-}
-
-async fn manifest(Path(_config): Path<String>) -> impl IntoResponse {
-    let addon = Addon::build().await;
+        .map_err(|e| (StatusCode::OK, e.to_string()))?;
 
     let manifest = json!(addon.manifest);
-    (StatusCode::OK, axum::response::Json(manifest))
+    Ok((StatusCode::OK, axum::response::Json(manifest)))
 }
 
 async fn catalog(
-    Path((config, catalog_type, catalog_path)): Path<(String, CatalogType, String)>,
+    Path((config, catalog_type, stremio_catalog_path)): Path<(String, CatalogType, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     // Ensure the path ends with `.json`
-    if !catalog_path.ends_with(".json") {
+    // This will remain true for every request from Stremio
+    if !stremio_catalog_path.ends_with(".json") {
         return Err((
             StatusCode::BAD_REQUEST,
             String::from("API expects GET request for JSON file. No valid extension provided."),
         ));
     }
 
-    // Extract path options requested by Stremio (i.e. genre, pagination)
-    let catalog_path_options = CatalogPathOptions::from_path(&catalog_path).map_err(|e| {
+    // Extract path options provided by Stremio (i.e. genre, pagination)
+    // We are storing the entire catalog config in the catalog_id provided by Stremio
+    let catalog_params = CatalogRequestParams::from_path(&stremio_catalog_path).map_err(|e| {
         let error_message = format!("Unable to parse CatalogPathOptions: {}", e);
         ((StatusCode::BAD_REQUEST), error_message)
     })?;
 
-    match catalog_path_options.source {
+    // Build catalog from parsed params based on query source, each CatalogParams vary by source
+    let response = match catalog_params.source {
         CatalogSource::Trakt => {
-            let response = TraktCatalog::from_catalog_path(&catalog_path_options)
+            let response = TraktCatalog::from_catalog_params(&catalog_params)
                 .await
                 .map_err(|e| {
                     let error_message = format!(
@@ -121,9 +110,11 @@ async fn catalog(
                     ((StatusCode::BAD_REQUEST), error_message)
                 })?;
 
-            Ok((StatusCode::OK, axum::response::Json(response)))
+            (StatusCode::OK, axum::response::Json(response)).into_response()
         }
-    }
+    };
+
+    Ok(response)
 }
 
 async fn trakt_list_id(

@@ -1,7 +1,8 @@
-use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
+use std::{env, fs};
 
-use crate::trakt::{TraktCatalog, TraktEndpoint, TraktResponse};
+use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CatalogSource {
@@ -14,7 +15,6 @@ pub enum CatalogSource {
 pub enum CatalogType {
     Movie,
     Series,
-    Unknown,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,66 +46,66 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    pub async fn build() -> Vec<Self> {
-        let mut trakt_movies_genres: Vec<String> = Vec::new();
-        let mut trakt_series_genres: Vec<String> = Vec::new();
-        let trakt_sort_values: Vec<String> = [
-            "Trending Now",
-            "New Releases",
-            "A-Z",
-            "Short & Sweet",
-            "Top Rated",
-            "Recently Watched",
-            "Fan Favorites",
-        ]
-        .iter()
-        .map(|sort| sort.to_string())
-        .collect();
-
-        // Get Trakt Movie Genres
-        let trakt_movie_genres_query =
-            TraktCatalog::query(TraktEndpoint::Genres, CatalogType::Movie)
-                .build()
-                .await
-                .unwrap();
-
-        if let TraktResponse::Genres(genres) = trakt_movie_genres_query {
-            trakt_movies_genres = genres.into_iter().map(|genre| genre.slug).collect()
-        }
-
-        // Get Trakt Series Genres
-        let trakt_series_genres_query =
-            TraktCatalog::query(TraktEndpoint::Genres, CatalogType::Series)
-                .build()
-                .await
-                .unwrap();
-
-        if let TraktResponse::Genres(genres) = trakt_series_genres_query {
-            trakt_series_genres = genres.into_iter().map(|genre| genre.slug).collect()
-        }
-
+    pub async fn export() -> Vec<Self> {
+        // TODO: Make this build dynamically from the user config
         let catalog1 = Self {
             name: "Netflix Movies".to_string(),
             id: "eyJlbmRwb2ludCI6Ikxpc3QiLCJwYWdpbmF0aW9uIjpudWxsLCJleHRlbmRlZF9pbmZvIjp0cnVlLCJsaXN0X2lkIjoiMjA3NjQ3NzAiLCJjYXRhbG9nX3R5cGUiOiJtb3ZpZSJ9-trakt".to_string(),
             catalog_type: CatalogType::Movie,
-            extra: vec![Extra::new("skip", None, false), Extra::new("genre", Some(trakt_sort_values.clone()), false)],
+            extra: vec![Extra::new("skip", None, false)],
         };
 
         let catalog2 = Self {
             name: "Netflix TV Shows".to_string(),
             id: "eyJlbmRwb2ludCI6Ikxpc3QiLCJwYWdpbmF0aW9uIjpudWxsLCJleHRlbmRlZF9pbmZvIjp0cnVlLCJsaXN0X2lkIjoiMjA3NjQ0NzEiLCJjYXRhbG9nX3R5cGUiOiJzZXJpZXMifQ==-trakt".to_string(),
             catalog_type: CatalogType::Series,
-            extra: vec![Extra::new("skip", None, false), Extra::new("genre",Some(trakt_sort_values.clone()), false)],
+            extra: vec![Extra::new("skip", None, false)],
         };
 
         let catalog3 = Self {
             name: "Broken Catalog YAY".to_string(),
             id: "elkajsdfyJlbmRwb2ludCI6Ikxpc3QiLCJwYWdpbmF0aW9uIjpudWxsLCJleHRlbmRlZF9pbmZvIjp0cnVlLCJsaXN0X2lkIjoiMjA3NjQ0NzEiLCJjYXRhbG9nX3R5cGUiOiJzZXJpZXMifQ==-trakt".to_string(),
             catalog_type: CatalogType::Series,
-            extra: vec![Extra::new("skip", None, false), Extra::new("genre",Some(trakt_sort_values), false)],
+            extra: vec![Extra::new("skip", None, false)],
         };
 
-        vec![catalog1, catalog2, catalog3]
+        let sample_catalog_list = vec![catalog1, catalog2, catalog3];
+
+        let catalog_list_json = serde_json::to_string_pretty(&sample_catalog_list).unwrap();
+
+        let mut exe_path = env::current_exe().unwrap();
+        exe_path.pop();
+        exe_path.push("manifest.json");
+        fs::write(&exe_path, catalog_list_json).unwrap();
+        println!("Generated manifest.json file at: {:?}", exe_path);
+
+        sample_catalog_list
+    }
+
+    pub fn from_config(config: &str) -> Result<Vec<Self>> {
+        let config_decoded = STANDARD.decode(config).map_err(|e| {
+            anyhow!(
+                "from_b64: Error decoding 'Catalogs List' from b64 to a vec: {}",
+                e.to_string()
+            )
+        })?;
+
+        let config_decoded_str = String::from_utf8(config_decoded).map_err(|e| {
+            anyhow!(
+                "from_b64: Error converting decoded b64 value to json string: {}",
+                e.to_string()
+            )
+        })?;
+
+        let catalogs_from_config: Vec<Self> = serde_json::from_str(config_decoded_str.as_str())
+            .map_err(|e| {
+                anyhow!(
+                    "from_b64: Error converting decoded json string to TraktCatalog struct: {}",
+                    e.to_string()
+                )
+            })?;
+
+        Ok(catalogs_from_config)
     }
 }
 
@@ -153,48 +153,18 @@ pub struct CatalogMeta {
     pub runtime: Option<String>,
 }
 
-impl CatalogMeta {
-    pub fn new(id: &str, name: &str, catalog_type: &str) -> Self {
-        let catalog_meta_type = match catalog_type.to_lowercase().as_str() {
-            "movie" => CatalogType::Movie,
-            "show" => CatalogType::Series,
-            "series" => CatalogType::Series,
-            _ => CatalogType::Unknown,
-        };
-        Self {
-            catalog_type: catalog_meta_type,
-            id: id.to_string(),
-            name: name.to_string(),
-            poster: None,
-            genres: None,
-            background: None,
-            release_info: None,
-            description: None,
-            behavior_hints: None,
-            trailer: None,
-            logo: None,
-            runtime: None,
-        }
-    }
-
-    pub fn genres(&mut self, genres: Vec<String>) -> &mut Self {
-        self.genres = Some(genres);
-        self
-    }
-}
-
 // Following types used for parsing incoming requests from Stremio to the API
 #[derive(Debug)]
-pub struct CatalogPathOptions {
+pub struct CatalogRequestParams {
     pub catalog_id: String,
-    pub pagination: PaginationPath,
+    pub pagination: PaginationDetails,
     pub genre: Option<String>,
     pub source: CatalogSource,
 }
 
-impl CatalogPathOptions {
+impl CatalogRequestParams {
     pub fn from_path(catalog_path: &str) -> Result<Self> {
-        // four scenarios
+        // four scenarios for the catalog_path
         // normal request:           /:config/catalog/:catalog_type/catalog_id.json
         // with pagination:          /:config/catalog/:catalog_type/catalog_id/skip=200.json
         // with genres:              /:config/catalog/:catalog_type/catalog_id/genre=Adventure.json
@@ -222,9 +192,9 @@ impl CatalogPathOptions {
         }?;
 
         match &catalog_path_segments.len() {
-            1 => Ok(CatalogPathOptions {
+            1 => Ok(CatalogRequestParams {
                 catalog_id: catalog_id_and_source[0].clone(),
-                pagination: PaginationPath {
+                pagination: PaginationDetails {
                     page: 1,
                     page_size: PAGE_SIZE,
                 },
@@ -260,9 +230,9 @@ impl CatalogPathOptions {
                     1
                 };
 
-                Ok(CatalogPathOptions {
+                Ok(CatalogRequestParams {
                     catalog_id,
-                    pagination: PaginationPath {
+                    pagination: PaginationDetails {
                         page,
                         page_size: PAGE_SIZE,
                     },
@@ -276,7 +246,7 @@ impl CatalogPathOptions {
 }
 
 #[derive(Debug)]
-pub struct PaginationPath {
+pub struct PaginationDetails {
     pub page: i32,
     pub page_size: i32,
 }

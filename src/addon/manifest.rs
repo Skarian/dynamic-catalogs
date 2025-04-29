@@ -1,4 +1,6 @@
 use super::catalog::{Catalog, CatalogType};
+use anyhow::anyhow;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -16,8 +18,9 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub async fn build() -> Self {
-        let catalogs = Catalog::build().await;
+    pub async fn build(config: &str) -> Result<Self> {
+        // let catalogs = Catalog::export().await;
+        let catalogs = Catalog::from_config(config)?;
         let catalog_types: Vec<CatalogType> = catalogs
             .iter()
             .map(|x| x.catalog_type)
@@ -32,7 +35,7 @@ impl Manifest {
                 vec![]
             }
         };
-        Self {
+        Ok(Self {
             id: "com.dynamic.catalogs".to_string(),
             version: "0.0.1".to_string(),
             name: "Dynamic Catalogs".to_string(),
@@ -41,7 +44,7 @@ impl Manifest {
             resources,
             types: catalog_types,
             catalogs,
-        }
+        })
     }
 }
 

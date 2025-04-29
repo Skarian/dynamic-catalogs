@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Result};
 use manifest::Manifest;
 
 pub mod catalog;
@@ -13,13 +14,14 @@ pub struct Addon {
 }
 
 impl Addon {
-    pub async fn build() -> Self {
-        let manifest = Manifest::build().await;
-        Self {
+    pub async fn build(config: &str) -> Result<Self> {
+        let manifest = Manifest::build(config).await?;
+
+        Ok(Self {
             transport_url: "todo".to_string(),
             transport_name: "todo".to_string(),
             manifest,
             flags: vec!["todo".to_string(), "todo".to_string()],
-        }
+        })
     }
 }
